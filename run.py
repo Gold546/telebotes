@@ -16,6 +16,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, timedelta
+
 base_url = "https://openrouter.ai/api/v1"
 
 if not AI_TOKEN:
@@ -79,11 +82,13 @@ def _extract_json(raw_text: str) -> dict | None:
 class DreamAnalis(StatesGroup):
     waiting_dream = State()
     waiting_emotion = State()
+    waiting_alarm_time = State()
 
 
 bot = Bot(Token)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+alarmer = AsyncIOScheduler()
 
 
 @dp.message(Command("start"), StateFilter(None))
@@ -237,12 +242,41 @@ async def stoping_check(message: Message, state: FSMContext):
     )
 
 
+async def wakeUp(chat_id: int):
+    await bot.send_message(chat_id, "Пора вставать!!!")
+
 @dp.message(Command("alarm"), StateFilter(None))
-async def cmd_alarm(message: Message):
+async def alarm(message: Message, state: FSMContext):
+    await state.set_state(DreamAnalis.waiting_alarm_time)
     await message.answer(
-        "⏰ Умный будильник Morpheuz\n\n"
-        "Эта функция уже создается! Совсем скоро я научусь высчитывать 90-минутные фазы сна, чтобы ты вставал с постели с максимальным зарядом энергии. Жди обновлений! 🚀"
+            "⏰ Умный будильник Morpheuz\n\n"
+            "Введи время пробуждения 🚀"
     )
+
+@dp.message(StateFilter(DreamAnalis.waiting_alarm_time))
+async def set_alarm(message: Message, state: FSMContext):
+        alarm_time = datetime.strptime(message.text, "%H:%M").time()
+
+        now = datetime.now()
+
+        alarm_datetime = datetime.combine(now.date(), alarm_time)
+
+        if alarm_datetime <= now:
+             alarm_datetime += timedelta(days=1)
+
+        alarmer.add_job(
+                wakeUp,
+                trigger="date",
+                run_date=alarm_datetime,
+                args=[message.chat.id]
+        )
+
+        await message.answer(
+                f"⏰ Будильник установлен на:\n"
+                f"{alarm_datetime.strftime('%d.%m.%Y %H:%M')}"
+        )
+
+        await state.clear()
 
 
 async def get_moon_data():
@@ -293,6 +327,7 @@ async def random_message(message: Message):
 
 
 async def main():
+    alarmer.start()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
