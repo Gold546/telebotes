@@ -3,13 +3,15 @@ import aiogram
 import asyncio
 import aiohttp
 
-from config import Token
+from openai import AsyncOpenAI
+import httpx
 
+from config import Token, AI_TOKEN
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroupS
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -20,12 +22,46 @@ import sql
 
 sql.init_db()
 
+base_url = "https://openrouter.ai/api/v1"
+
+if not AI_TOKEN:
+    raise ValueError("Критическая ошибка: AI_TOKEN (API-ключ OpenRouter) пустой!")
+
+ai_client = AsyncOpenAI(
+    api_key=AI_TOKEN,
+    base_url=base_url
+)
+
+STATIC_FALLBACK_MODELS = [
+    "meta-llama/llama-3-8b-instruct:free",
+    "google/gemini-2.5-flash:free",
+    "google/gemma-2-9b-it:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2-7b-instruct:free"
+]
+
+
+async def fetch_live_free_models() -> list[str]:
+    try:
+        clean_url = base_url.split("/v1")[0] + "/v1/models"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(clean_url, timeout=4)
+            if response.status_code == 200:
+                data = response.json()
+                models = data.get("data", [])
+                free_ids = [m["id"] for m in models if m.get("id", "").endswith(":free")]
+                if free_ids:
+                    return free_ids
+    except Exception as e:
+        logging.warning(f"Не удалось динамически обновить список моделей OpenRouter: {e}")
+    return STATIC_FALLBACK_MODELS
+
 
 class DreamAnalis(StatesGroup):
     waiting_dream = State()
     waiting_emotion = State()
-    waiting_raiting = State()  # Вернули наше состояние для отзыва
-    waiting_alarm_time = State()  # Будильник от команды на месте
+    waiting_raiting = State()
+    waiting_alarm_time = State()
 
 
 bot = Bot(Token)
@@ -36,7 +72,6 @@ alarmer = AsyncIOScheduler()
 
 @dp.message(Command("start"), StateFilter(None))
 async def cmd_start(message: Message):
-    # Сохраняем пользователя в БД при старте
     sql.save_user(user_id=message.from_user.id, username=message.from_user.username)
 
     await message.answer(
@@ -54,9 +89,9 @@ async def cmd_start(message: Message):
     )
 
 
-# Добавили waiting_raiting в фильтр отмены
 @dp.message(Command("cancel"),
-            StateFilter(DreamAnalis.waiting_dream, DreamAnalis.waiting_emotion, DreamAnalis.waiting_raiting))
+            StateFilter(DreamAnalis.waiting_dream, DreamAnalis.waiting_emotion, DreamAnalis.waiting_raiting,
+                        DreamAnalis.waiting_alarm_time))
 async def stoping(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
@@ -81,17 +116,93 @@ async def proces_dream(message: Message, state: FSMContext):
     await state.set_state(DreamAnalis.waiting_emotion)
 
 
+# ШАГ 3: Получаем эмоции и СРАЗУ вызываем ИИ (без промежуточного отзыва!)
 @dp.message(StateFilter(DreamAnalis.waiting_emotion), ~F.text.startswith('/'))
 async def proces_emotes(message: Message, state: FSMContext):
     await state.update_data(emoties=message.text)
-    await message.answer(
-        "🔮 Твои эмоции приняты!\nНачинаю связывать нити подсознания, расшифровка скоро будет готова...")
-    await message.answer(
-        "Оставьте отзыв на разбор сна, это очень поможет нашему развитию (1-10)"
-    )
-    await state.set_state(DreamAnalis.waiting_raiting)
+
+    await message.answer("🔮 Твои эмоции приняты!")
+    waiting_msg = await message.answer("🧠 Начинаю анализ твоего сна... Это может занять несколько секунд.")
+
+    user_data = await state.get_data()
+    dream_text = user_data.get('dream')
+    emotions_text = user_data.get('emoties')
+
+    prompt = f"Сюжет сна: {dream_text}\nЭмоции пользователя: {emotions_text}"
+    available_models = await fetch_live_free_models()
+    preferred_model = "meta-llama/llama-3-8b-instruct:free"
+
+    if preferred_model in available_models:
+        available_models.remove(preferred_model)
+    available_models.insert(0, preferred_model)
+
+    ai_text = None
+    last_error = "Список моделей пуст"
+
+    for model_name in available_models:
+        try:
+            logging.info(f"Запрос отправлен в бесплатную модель: {model_name}")
+            response = await ai_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты — тёплый, мудрый и внимательный психолог сна по имени MorpheuZ. "
+                            "Помоги пользователю понять его сон. Твой ответ должен состоять строго из трех разделов:\n\n"
+                            "✨ <b>Анализ твоего сна:</b>\n"
+                            "🔮 <b>Толкование:</b>\n(Напиши здесь теплое толкование сна на 3-4 предложения, связывая сюжет с эмоциями человека в реальной жизни)\n\n"
+                            "🌅 <b>Утренний вызов:</b>\n(Придумай одно простое физическое или ментальное задание на сегодня, вдохновленное этим сном)\n\n"
+                            "💡 <b>Совет:</b>\n(Дай короткую финальную рекомендацию или мотивацию в 1 предложение)\n\n"
+                            "Отвечай обычным текстом с использованием указанных HTML-тегов для жирного шрифта. Никакого JSON кода строить не нужно!"
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=900,
+                extra_headers={
+                    "HTTP-Referer": "https://localhost",
+                    "X-Title": "MorpheuZ Sleep Bot"
+                }
+            )
+
+            ai_text = response.choices[0].message.content
+            if ai_text:
+                break
+
+        except Exception as e:
+            last_error = str(e)
+            logging.warning(f"⚠️ Сбой бесплатной модели {model_name}: {last_error}")
+            continue
+
+    try:
+        await waiting_msg.delete()
+
+        if ai_text:
+            # Выводим готовый красивый разбор от ИИ
+            await message.answer(ai_text, parse_mode="HTML")
+
+            # Переводим в состояние ожидания отзыва ОКОНЧАТЕЛЬНО
+            await message.answer("✨ Разбор готов! Оцени, пожалуйста, насколько полезным был этот анализ (от 1 до 10):")
+            await state.set_state(DreamAnalis.waiting_raiting)
+        else:
+            await message.answer(
+                f"🛑 <b>Ошибка сети ИИ:</b> ни одна из доступных моделей не ответила.\n"
+                f"<i>Лог ошибки: {last_error}</i>"
+            )
+            await state.clear()
+            await cmd_start(message)
+
+    except Exception as e:
+        logging.error(f"Ошибка при выводе ответа ИИ: {e}")
+        await state.clear()
 
 
+# ШАГ 4: Принимаем оценку ПОСЛЕ разбора и сохраняем всё в БД
 @dp.message(StateFilter(DreamAnalis.waiting_raiting), ~F.text.startswith('/'))
 async def proces_raiting(message: Message, state: FSMContext):
     text = message.text.strip()
@@ -107,7 +218,7 @@ async def proces_raiting(message: Message, state: FSMContext):
     emotions_text = user_data.get('emoties')
     raiting_text = user_data.get('raiting')
 
-    # Запись в базу данных SQLite
+    # Сохраняем в SQLite полный набор: сон + эмоции + финальную оценку разбора
     sql.save_dream(
         user_id=message.from_user.id,
         dream=dream_text,
@@ -115,14 +226,11 @@ async def proces_raiting(message: Message, state: FSMContext):
         raiting=raiting_text
     )
 
-    await message.answer("🔮 Твой сон и отзыв успешно сохранены в подсознании Morpheuz. Спасибо!")
+    await message.answer("🔮 Твой сон и оценка успешно сохранены в подсознании Morpheuz. Спасибо за отзыв!")
     await state.clear()
-
-    # Показываем начальное меню после отзыва
     await cmd_start(message)
 
 
-# Добавили waiting_raiting в перехватчик команд
 @dp.message(StateFilter(DreamAnalis.waiting_dream, DreamAnalis.waiting_emotion, DreamAnalis.waiting_raiting),
             F.text.startswith('/'))
 async def stoping_check(message: Message, state: FSMContext):
@@ -149,29 +257,28 @@ async def alarm(message: Message, state: FSMContext):
 async def set_alarm(message: Message, state: FSMContext):
     try:
         alarm_time = datetime.strptime(message.text.strip(), "%H:%M").time()
+
+        now = datetime.now()
+        alarm_datetime = datetime.combine(now.date(), alarm_time)
+
+        if alarm_datetime <= now:
+            alarm_datetime += timedelta(days=1)
+
+        alarmer.add_job(
+            wakeUp,
+            trigger="date",
+            run_date=alarm_datetime,
+            args=[message.chat.id]
+        )
+
+        await message.answer(
+            f"⏰ Будильник установлен на:\n"
+            f"{alarm_datetime.strftime('%d.%m.%Y %H:%M')}"
+        )
+
+        await state.clear()
     except ValueError:
-        await message.answer("⚠️ Неверный формат времени! Напиши, например, 08:15")
-        return
-
-    now = datetime.now()
-    alarm_datetime = datetime.combine(now.date(), alarm_time)
-
-    if alarm_datetime <= now:
-        alarm_datetime += timedelta(days=1)
-
-    alarmer.add_job(
-        wakeUp,
-        trigger="date",
-        run_date=alarm_datetime,
-        args=[message.chat.id]
-    )
-
-    await message.answer(
-        f"⏰ Будильник установлен на:\n"
-        f"{alarm_datetime.strftime('%d.%m.%Y %H:%M')}"
-    )
-
-    await state.clear()
+        await message.answer("⚠️ Неверный формат времени! Используй ЧЧ:ММ (например, 07:30)")
 
 
 async def get_moon_data():
@@ -191,12 +298,9 @@ async def get_moon_data():
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             data = await response.json()
-
             luna_phase = data['astronomy']['astro']['moon_phase']
             illumination = data['astronomy']['astro']['moon_illumination']
-
             luna_new = Moon_phase_ruski.get(luna_phase, luna_phase)
-
             return f"фаза луны: {luna_new} освещение: {illumination}%"
 
 
